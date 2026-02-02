@@ -630,24 +630,32 @@ export default class TypeSyncPlugin extends Plugin {
     const prev = this.snapshots.get(file.path);
     const next = await this.buildSnapshot(file);
 
+    const prevType = prev?.typeValue ?? null;
+    const nextType = next.typeValue ?? null;
+    // If Type disappeared but revision markers remain, treat it as a transient rewrite.
+    const isTransientTypeRemoval = !!prevType && !nextType && !!next.noteRev;
+    if (isTransientTypeRemoval) {
+      return;
+    }
+
     // update snapshot early to avoid repeated prompts
     this.snapshots.set(file.path, next);
 
     // if Type removed: silently stop syncing this note
-    if (prev?.typeValue && !next.typeValue) {
+    if (prevType && !nextType) {
       return;
     }
 
     // type assignment/change logic
-    if ((prev?.typeValue ?? null) !== (next.typeValue ?? null)) {
+    if (prevType !== nextType) {
       await this.handleTypeValueChange(file, prev ?? null, next);
       return;
     }
 
     // if untyped: do nothing
-    if (!next.typeValue) return;
+    if (!nextType) return;
 
-    const typeValue = next.typeValue;
+    const typeValue = nextType;
 
     // ensure schema exists
     if (!this.schemas[typeValue]) {
