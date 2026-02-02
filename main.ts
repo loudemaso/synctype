@@ -638,16 +638,22 @@ export default class TypeSyncPlugin extends Plugin {
       return;
     }
 
+    const prevType = prev?.typeValue ?? null;
+    const nextType = next.typeValue ?? null;
+    // If the previous snapshot was missing Type but still had TypeSync revision markers,
+    // assume a transient frontmatter rewrite and treat it as the same type.
+    const treatPrevTypeAsNext = !prevType && !!nextType && !!prev?.noteRev;
+
     // type assignment/change logic
-    if ((prev?.typeValue ?? null) !== (next.typeValue ?? null)) {
+    if (!treatPrevTypeAsNext && prevType !== nextType) {
       await this.handleTypeValueChange(file, prev ?? null, next);
       return;
     }
 
     // if untyped: do nothing
-    if (!next.typeValue) return;
+    if (!nextType) return;
 
-    const typeValue = next.typeValue;
+    const typeValue = nextType;
 
     // ensure schema exists
     if (!this.schemas[typeValue]) {
