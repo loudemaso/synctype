@@ -986,6 +986,7 @@ export default class TypeSyncPlugin extends Plugin {
     this.schemaLocked = true;
     try {
       return await new Promise<boolean>((resolve) => {
+        let resolved = false;
         const m = new Modal(this.app);
         m.onOpen = () => {
           const { contentEl } = m;
@@ -998,19 +999,21 @@ export default class TypeSyncPlugin extends Plugin {
           const yesBtn = row.createEl("button", { text: yesText });
           yesBtn.classList.add("mod-cta");
           yesBtn.addEventListener("click", () => {
+            resolved = true;
             resolve(true);
             m.close();
           });
 
           const noBtn = row.createEl("button", { text: noText });
           noBtn.addEventListener("click", () => {
+            resolved = true;
             resolve(false);
             m.close();
           });
         };
         m.onClose = () => {
           // dismiss = No
-          // (only if not resolved yet; simplest: resolve(false) is okay but could double-resolve; ignore)
+          if (!resolved) resolve(false);
         };
         m.open();
       });
@@ -1023,7 +1026,9 @@ export default class TypeSyncPlugin extends Plugin {
     return this.app.vault.getMarkdownFiles().filter((f) => {
       const snap = this.snapshots.get(f.path);
       if (snap) return snap.typeValue === typeValue;
-      return false;
+      const cachedType = this.app.metadataCache.getFileCache(f)?.frontmatter?.[TYPE_KEY];
+      if (typeof cachedType !== "string") return false;
+      return cachedType.trim() === typeValue;
     });
   }
 
