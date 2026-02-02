@@ -22,17 +22,16 @@ interface TypeSchema {
 export interface TypeSyncSettings {
   mySetting: string;
   syncOrder: boolean;
-  debounceMs: number;
   syncPropertyRemovals: boolean;
 }
 
 const DEFAULT_SETTINGS: TypeSyncSettings = {
   mySetting: "default",
   syncOrder: true,
-  debounceMs: 350,
   syncPropertyRemovals: false,
 };
 
+const DEBOUNCE_MS = 350;
 const TYPE_KEY = "Type";
 const REV_AT_KEY = "_typesync_rev_at";
 const REV_ID_KEY = "_typesync_rev_id";
@@ -433,20 +432,6 @@ class TypeSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Debounce (ms)")
-      .setDesc("Delay before TypeSync reacts to edits. Higher values reduce jitter with the Properties UI.")
-      .addSlider((s) =>
-        s
-          .setLimits(0, 1500, 50)
-          .setValue(this.plugin.settings.debounceMs)
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            this.plugin.settings.debounceMs = v;
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Sync property removals")
       .setDesc("If enabled, properties removed from the schema are removed from notes when applying the schema.")
       .addToggle((toggle) =>
@@ -480,7 +465,11 @@ export default class TypeSyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     const loaded = await this.loadData();
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded?.settings ?? loaded ?? {});
+    const loadedSettings = (loaded?.settings ?? loaded ?? {}) as Record<string, unknown>;
+    if ("debounceMs" in loadedSettings) {
+      delete loadedSettings.debounceMs;
+    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedSettings);
     this.schemas = loaded?.schemas ?? loaded?.schemasByType ?? loaded?.schemas ?? {};
     this.schemaDataPath = normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`);
 
@@ -584,7 +573,7 @@ export default class TypeSyncPlugin extends Plugin {
         const timer = window.setTimeout(() => {
           this.debounceTimers.delete(path);
           this.handleModify(file).catch((e) => console.error("TypeSync modify error", e));
-        }, this.settings.debounceMs);
+        }, DEBOUNCE_MS);
 
         this.debounceTimers.set(path, timer);
       })
