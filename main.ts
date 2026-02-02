@@ -6,7 +6,6 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
-  TFolder,
   normalizePath,
   stringifyYaml,
   parseYaml,
@@ -16,21 +15,42 @@ type TypeName = string;
 
 interface TypeSchema {
   keysOrdered: string[]; // includes "Type"
+  rev: SchemaRevision;
+  lastChangeSummary?: SchemaChangeSummary;
 }
 
 export interface TypeSyncSettings {
   mySetting: string;
   syncOrder: boolean;
   debounceMs: number;
+  syncPropertyRemovals: boolean;
 }
 
 const DEFAULT_SETTINGS: TypeSyncSettings = {
   mySetting: "default",
   syncOrder: true,
   debounceMs: 350,
+  syncPropertyRemovals: false,
 };
 
 const TYPE_KEY = "Type";
+const REV_AT_KEY = "_typesync_rev_at";
+const REV_ID_KEY = "_typesync_rev_id";
+const INTERNAL_KEYS = new Set([REV_AT_KEY, REV_ID_KEY]);
+const LOCAL_SCHEMA_STORAGE_KEY = "typesync_last_seen_schemas";
+
+interface SchemaRevision {
+  updatedAt: number;
+  revisionId: string;
+}
+
+interface SchemaChangeSummary {
+  added: string[];
+  removed: string[];
+  orderChanged: boolean;
+  updatedAt: number;
+  revisionId: string;
+}
 
 interface Snapshot {
   typeValue: TypeName | null;
@@ -39,6 +59,7 @@ interface Snapshot {
   frontmatterObj: Record<string, any>;
   hasFrontmatter: boolean;
   rawContent: string;            // for minimal revert when needed
+  noteRev: SchemaRevision | null;
 }
 
 type Diff = {
@@ -231,6 +252,7 @@ class TypeChangeModal extends Modal {
     private prevType: string | null,
     private nextType: string,
     private nextTypeExists: boolean,
+    private allowRemovals: boolean,
     private onResolve: (d: TypeChangeDecision) => void
   ) {
     super(app);
@@ -242,11 +264,12 @@ class TypeChangeModal extends Modal {
     this.titleEl.setText("TypeSync");
 
     if (this.nextTypeExists) {
+      const removalWarning = this.allowRemovals ? "\nWarning: This removes properties not in the schema." : "";
       contentEl.createEl("p", {
         text:
           `Type "${this.nextType}" already exists.\n` +
           `Do you want to change this note to Type "${this.nextType}" and align its properties to that schema?` +
-          `\nWarning: This removes properties not in the schema.`,
+          removalWarning,
       });
 
       const row = contentEl.createDiv({ cls: "typesync-progress-row" });
@@ -339,6 +362,53 @@ class TypeChangeModal extends Modal {
   }
 }
 
+type SchemaChangeNotice = {
+  typeValue: string;
+  added: string[];
+  removed: string[];
+  orderChanged: boolean;
+};
+
+class SchemaUpdateInfoModal extends Modal {
+  constructor(app: App, private changes: SchemaChangeNotice[]) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    this.titleEl.setText("TypeSync");
+
+    contentEl.createEl("p", { text: "Schema updates detected:" });
+
+    this.changes.forEach((change) => {
+      const section = contentEl.createDiv({ cls: "typesync-schema-summary" });
+      section.createEl("strong", { text: `Type "${change.typeValue}"` });
+
+      if (change.added.length > 0) {
+        section.createEl("div", { text: "Added properties:" });
+        const ul = section.createEl("ul", { cls: "typesync-list" });
+        change.added.forEach((k) => ul.createEl("li", { text: k }));
+      }
+
+      if (change.removed.length > 0) {
+        section.createEl("div", { text: "Removed properties:" });
+        const ul = section.createEl("ul", { cls: "typesync-list" });
+        change.removed.forEach((k) => ul.createEl("li", { text: k }));
+      }
+
+      if (change.orderChanged) {
+        section.createEl("div", { text: "Order updated." });
+      }
+    });
+
+    const row = contentEl.createDiv({ cls: "typesync-progress-row" });
+    const dismissBtn = row.createEl("button", { text: "Dismiss" });
+    dismissBtn.classList.add("mod-cta");
+    dismissBtn.addEventListener("click", () => this.close());
+  }
+}
+
 class TypeSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: TypeSyncPlugin) {
     super(app, plugin);
@@ -375,6 +445,18 @@ class TypeSyncSettingTab extends PluginSettingTab {
             await this.plugin.savePluginData();
           })
       );
+
+    new Setting(containerEl)
+      .setName("Sync property removals")
+      .setDesc("If enabled, properties removed from the schema are removed from notes when applying the schema.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.syncPropertyRemovals)
+          .onChange(async (v) => {
+            this.plugin.settings.syncPropertyRemovals = v;
+            await this.plugin.savePluginData();
+          })
+      );
   }
 }
 
@@ -383,6 +465,9 @@ export default class TypeSyncPlugin extends Plugin {
 
   private schemas: Record<TypeName, TypeSchema> = {};
   private snapshots: Map<string, Snapshot> = new Map();
+  private pendingTypes: Set<string> = new Set();
+  private ignoreNextSchemaReload = false;
+  private schemaDataPath = "";
 
   // suppression so TypeSync edits never cause prompts
   private suppressedPaths: Map<string, number> = new Map();
@@ -397,15 +482,10 @@ export default class TypeSyncPlugin extends Plugin {
     const loaded = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded?.settings ?? loaded ?? {});
     this.schemas = loaded?.schemas ?? loaded?.schemasByType ?? loaded?.schemas ?? {};
+    this.schemaDataPath = normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`);
 
     // normalize schemas
-    for (const [t, s] of Object.entries(this.schemas)) {
-      if (!s || !Array.isArray((s as any).keysOrdered)) {
-        this.schemas[t] = { keysOrdered: [TYPE_KEY] };
-      } else if (!(s as any).keysOrdered.includes(TYPE_KEY)) {
-        (s as any).keysOrdered.unshift(TYPE_KEY);
-      }
-    }
+    this.normalizeSchemas(this.schemas);
 
     this.addSettingTab(new TypeSyncSettingTab(this.app, this));
 
@@ -421,8 +501,14 @@ export default class TypeSyncPlugin extends Plugin {
         if (!snap.typeValue) { new Notice(`No "${TYPE_KEY}" set on this note.`); return; }
         const typeValue = snap.typeValue;
 
-        this.schemas[typeValue] = { keysOrdered: [...snap.keysOrdered] };
+        const rev = this.createSchemaRevision();
+        this.schemas[typeValue] = {
+          keysOrdered: [...snap.keysOrdered],
+          rev,
+          lastChangeSummary: this.buildChangeSummary([], [], false, rev),
+        };
         await this.savePluginData();
+        await this.updateLocalSchemaCache();
         new Notice(`TypeSync: schema for "${typeValue}" set to match this file (no edits made).`);
       },
     });
@@ -482,6 +568,10 @@ export default class TypeSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
         if (!(file instanceof TFile)) return;
+        if (file.path === this.schemaDataPath) {
+          this.handleSchemaFileModify(file).catch((e) => console.error("TypeSync schema reload error", e));
+          return;
+        }
         if (file.extension !== "md") return;
 
         const path = file.path;
@@ -502,9 +592,12 @@ export default class TypeSyncPlugin extends Plugin {
 
     // seed snapshots
     await this.seedSnapshots();
+
+    await this.reportSchemaChangesFromLastSeen();
   }
 
   async savePluginData(): Promise<void> {
+    this.ignoreNextSchemaReload = true;
     await this.saveData({
       settings: this.settings,
       schemas: this.schemas,
@@ -569,13 +662,33 @@ export default class TypeSyncPlugin extends Plugin {
 
     // ensure schema exists
     if (!this.schemas[typeValue]) {
+      if (next.noteRev) {
+        this.pendingTypes.add(typeValue);
+        return;
+      }
       // create schema from current file properties/order (includes Type)
-      this.schemas[typeValue] = { keysOrdered: [...next.keysOrdered] };
+      {
+        const rev = this.createSchemaRevision();
+        this.schemas[typeValue] = {
+          keysOrdered: [...next.keysOrdered],
+          rev,
+          lastChangeSummary: this.buildChangeSummary([...next.keysSet], [], false, rev),
+        };
+      }
       await this.savePluginData();
+      await this.updateLocalSchemaCache();
       return;
     }
 
     const schema = this.schemas[typeValue];
+    if (this.isNoteAheadOfSchema(next.noteRev, schema.rev)) {
+      this.pendingTypes.add(typeValue);
+      return;
+    }
+    if (this.isSchemaAheadOfNote(schema.rev, next.noteRev)) {
+      await this.rewriteToSchema(file, typeValue, { preserveOverlapValues: true });
+      return;
+    }
     const diff = this.computeDiff(prev ?? next, next);
 
     // order-only change: silently update schema order and propagate, if enabled
@@ -595,7 +708,9 @@ export default class TypeSyncPlugin extends Plugin {
       }
 
       schema.keysOrdered = [...next.keysOrdered];
+      this.updateSchemaRevision(schema, { added: [], removed: [], orderChanged: true });
       await this.savePluginData();
+      await this.updateLocalSchemaCache();
 
       await this.runBulk({
         title: `Syncing order for Type "${typeValue}"`,
@@ -639,7 +754,13 @@ export default class TypeSyncPlugin extends Plugin {
           schema.keysOrdered = [...cur, ...missing];
         }
 
+        this.updateSchemaRevision(schema, {
+          added: diff.added,
+          removed: diff.removed,
+          orderChanged: diff.orderChanged,
+        });
         await this.savePluginData();
+        await this.updateLocalSchemaCache();
 
         // propagate across all files of that type
         await this.runBulk({
@@ -717,8 +838,11 @@ export default class TypeSyncPlugin extends Plugin {
 
     // If prevType is null and nextType exists -> ask to align (destructive) or cancel (remove Type)
     if (!prevType && nextExists) {
+      const removalWarning = this.settings.syncPropertyRemovals
+        ? " Warning: This removes properties not in the schema."
+        : "";
       const ok = await this.promptYesNo(
-        `Update this file to match Type "${nextType}"? Warning: This removes properties not in the schema.`,
+        `Update this file to match Type "${nextType}"?${removalWarning}`,
         "Align to schema",
         "Cancel"
       );
@@ -738,7 +862,7 @@ export default class TypeSyncPlugin extends Plugin {
       // prompt via modal (OK / Cancel)
       const decision = await new Promise<TypeChangeDecision>((resolve) => {
         this.schemaLocked = true;
-        new TypeChangeModal(this.app, null, nextType, false, resolve).open();
+        new TypeChangeModal(this.app, null, nextType, false, this.settings.syncPropertyRemovals, resolve).open();
       }).finally(() => {
         this.schemaLocked = false;
       });
@@ -750,8 +874,16 @@ export default class TypeSyncPlugin extends Plugin {
       }
 
       // create new type from current file order/keys
-      this.schemas[nextType] = { keysOrdered: [...next.keysOrdered] };
+      {
+        const rev = this.createSchemaRevision();
+        this.schemas[nextType] = {
+          keysOrdered: [...next.keysOrdered],
+          rev,
+          lastChangeSummary: this.buildChangeSummary([...next.keysSet], [], false, rev),
+        };
+      }
       await this.savePluginData();
+      await this.updateLocalSchemaCache();
       return;
     }
 
@@ -759,7 +891,7 @@ export default class TypeSyncPlugin extends Plugin {
     if (prevType && nextExists) {
       const decision = await new Promise<TypeChangeDecision>((resolve) => {
         this.schemaLocked = true;
-        new TypeChangeModal(this.app, prevType, nextType, true, resolve).open();
+        new TypeChangeModal(this.app, prevType, nextType, true, this.settings.syncPropertyRemovals, resolve).open();
       }).finally(() => {
         this.schemaLocked = false;
       });
@@ -783,7 +915,7 @@ export default class TypeSyncPlugin extends Plugin {
     if (prevType && !nextExists) {
       const decision = await new Promise<TypeChangeDecision>((resolve) => {
         this.schemaLocked = true;
-        new TypeChangeModal(this.app, prevType, nextType, false, resolve).open();
+        new TypeChangeModal(this.app, prevType, nextType, false, this.settings.syncPropertyRemovals, resolve).open();
       }).finally(() => {
         this.schemaLocked = false;
       });
@@ -795,8 +927,16 @@ export default class TypeSyncPlugin extends Plugin {
       }
 
       if (decision.kind === "createNewType") {
-        this.schemas[nextType] = { keysOrdered: [...next.keysOrdered] };
+        {
+          const rev = this.createSchemaRevision();
+          this.schemas[nextType] = {
+            keysOrdered: [...next.keysOrdered],
+            rev,
+            lastChangeSummary: this.buildChangeSummary([...next.keysSet], [], false, rev),
+          };
+        }
         await this.savePluginData();
+        await this.updateLocalSchemaCache();
         return;
       }
 
@@ -808,12 +948,20 @@ export default class TypeSyncPlugin extends Plugin {
         const schema = this.schemas[fromType];
         if (!schema) {
           // fallback: create schema from current file
-          this.schemas[toType] = { keysOrdered: [...next.keysOrdered] };
+          {
+            const rev = this.createSchemaRevision();
+            this.schemas[toType] = {
+              keysOrdered: [...next.keysOrdered],
+              rev,
+              lastChangeSummary: this.buildChangeSummary([...next.keysSet], [], false, rev),
+            };
+          }
         } else {
           this.schemas[toType] = schema;
         }
         delete this.schemas[fromType];
         await this.savePluginData();
+        await this.updateLocalSchemaCache();
 
         const files = this.getFilesByType(fromType);
 
@@ -924,9 +1072,10 @@ export default class TypeSyncPlugin extends Plugin {
     const { frontmatterText, bodyText, hasFrontmatter } = this.extractFrontmatter(rawContent);
 
     const fmObj: Record<string, any> = hasFrontmatter ? (parseYaml(frontmatterText) ?? {}) : {};
-    const keysSet = new Set(Object.keys(fmObj));
+    const keysSet = new Set(Object.keys(fmObj).filter((k) => !INTERNAL_KEYS.has(k)));
 
     const typeValue = this.extractTypeValue(fmObj);
+    const noteRev = this.extractNoteRevision(fmObj);
 
     const keysOrdered = hasFrontmatter
       ? this.extractOrderedKeysFromFrontmatterText(frontmatterText, keysSet)
@@ -944,6 +1093,7 @@ export default class TypeSyncPlugin extends Plugin {
       frontmatterObj: fmObj,
       hasFrontmatter,
       rawContent,
+      noteRev,
     };
   }
 
@@ -952,6 +1102,14 @@ export default class TypeSyncPlugin extends Plugin {
     if (typeof v !== "string") return null;
     const t = v.trim();
     return t.length ? t : null;
+  }
+
+  private extractNoteRevision(fmObj: Record<string, any>): SchemaRevision | null {
+    const at = fmObj?.[REV_AT_KEY];
+    const id = fmObj?.[REV_ID_KEY];
+    if (typeof at !== "number" || !Number.isFinite(at)) return null;
+    if (typeof id !== "string" || id.trim().length === 0) return null;
+    return { updatedAt: at, revisionId: id };
   }
 
   private extractFrontmatter(content: string): { frontmatterText: string; bodyText: string; hasFrontmatter: boolean } {
@@ -999,11 +1157,13 @@ export default class TypeSyncPlugin extends Plugin {
     const typeValue = snap.typeValue;
     if (typeValue && this.schemas[typeValue]) {
       // If we have schema, ensure schema order if syncOrder enabled; otherwise keep snap order
-      const desiredOrder = this.settings.syncOrder ? this.schemas[typeValue].keysOrdered : snap.keysOrdered;
+      let desiredOrder = this.settings.syncOrder ? this.schemas[typeValue].keysOrdered : snap.keysOrdered;
+      desiredOrder = this.appendInternalKeys(desiredOrder, snap.frontmatterObj);
       await this.rewriteFrontmatterByOrder(file, desiredOrder, snap.frontmatterObj, { forceTypeValue: typeValue });
     } else {
       // no schema: just rewrite with snapshot order
-      await this.rewriteFrontmatterByOrder(file, snap.keysOrdered, snap.frontmatterObj, {});
+      const desiredOrder = this.appendInternalKeys(snap.keysOrdered, snap.frontmatterObj);
+      await this.rewriteFrontmatterByOrder(file, desiredOrder, snap.frontmatterObj, {});
     }
   }
 
@@ -1021,11 +1181,15 @@ export default class TypeSyncPlugin extends Plugin {
     // Build new frontmatter values:
     // - keep overlap values
     // - add missing as null
-    // - remove non-schema keys
+    // - optionally keep non-schema keys (if removals disabled)
     // - ensure Type equals typeValue
     const desiredKeys = schema.keysOrdered.includes(TYPE_KEY)
       ? schema.keysOrdered
       : [TYPE_KEY, ...schema.keysOrdered];
+    const extraKeys = this.settings.syncPropertyRemovals
+      ? []
+      : current.keysOrdered.filter((k) => !desiredKeys.includes(k));
+    const finalKeys = [...desiredKeys, ...extraKeys];
 
     const outObj: Record<string, any> = {};
 
@@ -1033,7 +1197,7 @@ export default class TypeSyncPlugin extends Plugin {
     const renameFrom = opts.renameHint?.from;
     const renameTo = opts.renameHint?.to;
 
-    for (const key of desiredKeys) {
+    for (const key of finalKeys) {
       if (key === TYPE_KEY) {
         outObj[TYPE_KEY] = typeValue;
         continue;
@@ -1051,15 +1215,18 @@ export default class TypeSyncPlugin extends Plugin {
       }
     }
 
+    this.applyRevisionMarkers(outObj, schema.rev);
+
     // When order sync is disabled, we preserve existing file order as much as possible:
-    // filter existing order to desired keys, then append missing in schema order.
-    let finalOrder: string[] = desiredKeys;
+    // filter existing order to final keys, then append missing in schema order.
+    let finalOrder: string[] = finalKeys;
     if (!this.settings.syncOrder) {
       const existingOrder = current.keysOrdered;
-      const filtered = existingOrder.filter((k) => desiredKeys.includes(k));
-      const missing = desiredKeys.filter((k) => !filtered.includes(k));
+      const filtered = existingOrder.filter((k) => finalKeys.includes(k));
+      const missing = finalKeys.filter((k) => !filtered.includes(k));
       finalOrder = [...filtered, ...missing];
     }
+    finalOrder = this.appendInternalKeys(finalOrder, outObj);
 
     await this.rewriteFrontmatterByOrder(file, finalOrder, outObj, { forceTypeValue: typeValue });
   }
@@ -1069,7 +1236,8 @@ export default class TypeSyncPlugin extends Plugin {
     const obj = { ...snap.frontmatterObj, [TYPE_KEY]: typeValue };
     const order = snap.hasFrontmatter ? snap.keysOrdered : [TYPE_KEY, ...Object.keys(obj)];
     // Ensure Type is in order
-    const finalOrder = order.includes(TYPE_KEY) ? order : [TYPE_KEY, ...order];
+    const baseOrder = order.includes(TYPE_KEY) ? order : [TYPE_KEY, ...order];
+    const finalOrder = this.appendInternalKeys(baseOrder, obj);
     await this.rewriteFrontmatterByOrder(file, finalOrder, obj, { forceTypeValue: typeValue });
   }
 
@@ -1077,8 +1245,11 @@ export default class TypeSyncPlugin extends Plugin {
     const snap = await this.buildSnapshot(file);
     const obj = { ...snap.frontmatterObj };
     delete obj[TYPE_KEY];
+    delete obj[REV_AT_KEY];
+    delete obj[REV_ID_KEY];
     const order = snap.keysOrdered.filter((k) => k !== TYPE_KEY);
-    await this.rewriteFrontmatterByOrder(file, order, obj, {});
+    const finalOrder = this.appendInternalKeys(order, obj);
+    await this.rewriteFrontmatterByOrder(file, finalOrder, obj, {});
   }
 
   private async rewriteFrontmatterByOrder(
@@ -1132,5 +1303,189 @@ export default class TypeSyncPlugin extends Plugin {
 
   private escapeRegex(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  private normalizeSchemas(schemas: Record<TypeName, TypeSchema>): void {
+    for (const [t, s] of Object.entries(schemas)) {
+      if (!s || !Array.isArray((s as any).keysOrdered)) {
+        schemas[t] = { keysOrdered: [TYPE_KEY], rev: this.createSchemaRevision() };
+        continue;
+      }
+      if (!(s as any).keysOrdered.includes(TYPE_KEY)) {
+        (s as any).keysOrdered.unshift(TYPE_KEY);
+      }
+      if (!(s as any).rev) {
+        (s as any).rev = this.createSchemaRevision();
+      }
+    }
+  }
+
+  private createSchemaRevision(): SchemaRevision {
+    return { updatedAt: Date.now(), revisionId: this.generateRevisionId() };
+  }
+
+  private generateRevisionId(): string {
+    return Math.random().toString(36).slice(2, 10);
+  }
+
+  private compareRevisions(a: SchemaRevision, b: SchemaRevision): number {
+    if (a.updatedAt !== b.updatedAt) return a.updatedAt - b.updatedAt;
+    return a.revisionId.localeCompare(b.revisionId);
+  }
+
+  private isNoteAheadOfSchema(noteRev: SchemaRevision | null, schemaRev: SchemaRevision): boolean {
+    if (!noteRev) return false;
+    return this.compareRevisions(noteRev, schemaRev) > 0;
+  }
+
+  private isSchemaAheadOfNote(schemaRev: SchemaRevision, noteRev: SchemaRevision | null): boolean {
+    const note = noteRev ?? { updatedAt: 0, revisionId: "" };
+    return this.compareRevisions(schemaRev, note) > 0;
+  }
+
+  private applyRevisionMarkers(fmObj: Record<string, any>, rev: SchemaRevision): void {
+    fmObj[REV_AT_KEY] = rev.updatedAt;
+    fmObj[REV_ID_KEY] = rev.revisionId;
+  }
+
+  private appendInternalKeys(order: string[], fmObj: Record<string, any>): string[] {
+    const next = [...order];
+    for (const key of INTERNAL_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(fmObj, key) && !next.includes(key)) {
+        next.push(key);
+      }
+    }
+    return next;
+  }
+
+  private updateSchemaRevision(
+    schema: TypeSchema,
+    change: { added: string[]; removed: string[]; orderChanged: boolean }
+  ): void {
+    const rev = this.createSchemaRevision();
+    schema.rev = rev;
+    schema.lastChangeSummary = this.buildChangeSummary(change.added, change.removed, change.orderChanged, rev);
+  }
+
+  private buildChangeSummary(
+    added: string[],
+    removed: string[],
+    orderChanged: boolean,
+    rev: SchemaRevision
+  ): SchemaChangeSummary {
+    const sanitize = (keys: string[]) => keys.filter((k) => k !== TYPE_KEY && !INTERNAL_KEYS.has(k));
+    return {
+      added: sanitize(added),
+      removed: sanitize(removed),
+      orderChanged,
+      updatedAt: rev.updatedAt,
+      revisionId: rev.revisionId,
+    };
+  }
+
+  private async handleSchemaFileModify(file: TFile): Promise<void> {
+    if (file.path !== this.schemaDataPath) return;
+    if (this.ignoreNextSchemaReload) {
+      this.ignoreNextSchemaReload = false;
+      return;
+    }
+    const loaded = await this.loadData();
+    if (loaded?.settings) {
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded.settings);
+    }
+    const nextSchemas = loaded?.schemas ?? loaded?.schemasByType ?? loaded?.schemas ?? {};
+    this.normalizeSchemas(nextSchemas);
+
+    const changes = this.computeSchemaChangeNotices(this.schemas, nextSchemas);
+    this.schemas = nextSchemas;
+
+    await this.updateLocalSchemaCache();
+
+    if (changes.length > 0) {
+      new SchemaUpdateInfoModal(this.app, changes).open();
+    }
+  }
+
+  private computeSchemaChangeNotices(
+    prev: Record<TypeName, TypeSchema>,
+    next: Record<TypeName, TypeSchema>
+  ): SchemaChangeNotice[] {
+    const notices: SchemaChangeNotice[] = [];
+
+    for (const [typeValue, nextSchema] of Object.entries(next)) {
+      const prevSchema = prev[typeValue];
+      if (!prevSchema) {
+        notices.push({
+          typeValue,
+          added: nextSchema.keysOrdered.filter((k) => k !== TYPE_KEY),
+          removed: [],
+          orderChanged: false,
+        });
+        continue;
+      }
+
+      if (this.compareRevisions(prevSchema.rev, nextSchema.rev) === 0) continue;
+
+      const prevSet = new Set(prevSchema.keysOrdered);
+      const nextSet = new Set(nextSchema.keysOrdered);
+      const added = [...nextSet].filter((k) => !prevSet.has(k));
+      const removed = [...prevSet].filter((k) => !nextSet.has(k));
+
+      let orderChanged = false;
+      if (prevSchema.keysOrdered.length === nextSchema.keysOrdered.length) {
+        orderChanged = !prevSchema.keysOrdered.every((k, i) => nextSchema.keysOrdered[i] === k);
+      } else {
+        const sameSet =
+          prevSet.size === nextSet.size &&
+          [...prevSet].every((k) => nextSet.has(k));
+        orderChanged = sameSet;
+      }
+
+      notices.push({
+        typeValue,
+        added: added.filter((k) => k !== TYPE_KEY),
+        removed: removed.filter((k) => k !== TYPE_KEY),
+        orderChanged,
+      });
+    }
+
+    return notices;
+  }
+
+  private async reportSchemaChangesFromLastSeen(): Promise<void> {
+    const lastSeen = this.loadLocalSchemaCache();
+    const current = this.schemas;
+    if (Object.keys(lastSeen).length > 0) {
+      const notices = this.computeSchemaChangeNotices(lastSeen, current);
+      if (notices.length > 0) {
+        new SchemaUpdateInfoModal(this.app, notices).open();
+      }
+    }
+    await this.updateLocalSchemaCache();
+  }
+
+  private loadLocalSchemaCache(): Record<TypeName, TypeSchema> {
+    const raw = window.localStorage.getItem(LOCAL_SCHEMA_STORAGE_KEY);
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw) as Record<TypeName, TypeSchema>;
+      if (!parsed || typeof parsed !== "object") return {};
+      this.normalizeSchemas(parsed);
+      return parsed;
+    } catch {
+      return {};
+    }
+  }
+
+  private async updateLocalSchemaCache(): Promise<void> {
+    const snapshot: Record<TypeName, TypeSchema> = {};
+    for (const [typeValue, schema] of Object.entries(this.schemas)) {
+      snapshot[typeValue] = {
+        keysOrdered: [...schema.keysOrdered],
+        rev: { ...schema.rev },
+        lastChangeSummary: schema.lastChangeSummary,
+      };
+    }
+    window.localStorage.setItem(LOCAL_SCHEMA_STORAGE_KEY, JSON.stringify(snapshot));
   }
 }
