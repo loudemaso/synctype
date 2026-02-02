@@ -433,20 +433,6 @@ class TypeSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Debounce (ms)")
-      .setDesc("Delay before TypeSync reacts to edits. Higher values reduce jitter with the Properties UI.")
-      .addSlider((s) =>
-        s
-          .setLimits(0, 1500, 50)
-          .setValue(this.plugin.settings.debounceMs)
-          .setDynamicTooltip()
-          .onChange(async (v) => {
-            this.plugin.settings.debounceMs = v;
-            await this.plugin.savePluginData();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Sync property removals")
       .setDesc("If enabled, properties removed from the schema are removed from notes when applying the schema.")
       .addToggle((toggle) =>
@@ -481,6 +467,7 @@ export default class TypeSyncPlugin extends Plugin {
   async onload(): Promise<void> {
     const loaded = await this.loadData();
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded?.settings ?? loaded ?? {});
+    this.settings.debounceMs = DEFAULT_SETTINGS.debounceMs;
     this.schemas = loaded?.schemas ?? loaded?.schemasByType ?? loaded?.schemas ?? {};
     this.schemaDataPath = normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/data.json`);
 
