@@ -460,6 +460,9 @@ export default class TypeSyncPlugin extends Plugin {
   // debounce modify events per file
   private debounceTimers: Map<string, number> = new Map();
 
+  // coalesce transient Type removals
+  private pendingTypeRemovalTimers: Map<string, number> = new Map();
+
   // lock schema while modal or bulk op
   private schemaLocked = false;
 
@@ -630,11 +633,31 @@ export default class TypeSyncPlugin extends Plugin {
     const prev = this.snapshots.get(file.path);
     const next = await this.buildSnapshot(file);
 
-    // update snapshot early to avoid repeated prompts
-    this.snapshots.set(file.path, next);
+    const prevType = prev?.typeValue ?? null;
+    const nextType = next.typeValue ?? null;
 
-    // if Type removed: silently stop syncing this note
-    if (prev?.typeValue && !next.typeValue) {
+    const pendingRemoval = this.pendingTypeRemovalTimers.get(file.path);
+    if (nextType && pendingRemoval) {
+      window.clearTimeout(pendingRemoval);
+      this.pendingTypeRemovalTimers.delete(file.path);
+    }
+
+    // if Type removed: defer snapshot update to avoid transient removals triggering align prompts
+    if (prevType && !nextType) {
+      if (!pendingRemoval) {
+        const timer = window.setTimeout(async () => {
+          this.pendingTypeRemovalTimers.delete(file.path);
+          try {
+            const latest = await this.buildSnapshot(file);
+            if (!latest.typeValue) {
+              this.snapshots.set(file.path, latest);
+            }
+          } catch {
+            // ignore
+          }
+        }, DEBOUNCE_MS);
+        this.pendingTypeRemovalTimers.set(file.path, timer);
+      }
       return;
     }
 
